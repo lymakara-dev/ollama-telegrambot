@@ -5,6 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$PROJECT_ROOT/.venv"
 ENV_FILE="$PROJECT_ROOT/.env"
 ENV_EXAMPLE_FILE="$PROJECT_ROOT/.env.example"
+RUNTIME_DIR="$PROJECT_ROOT/runtime"
 
 usage() {
   cat <<'USAGE'
@@ -20,6 +21,8 @@ Options:
   --bot-token <token>         Telegram bot token (written to .env)
   --webhook-secret <secret>   Telegram webhook secret (written to .env)
   --public-url <https-url>    Public HTTPS URL for webhook setup (e.g., ngrok URL)
+  --auto-ngrok                Start ngrok automatically (if installed) and use its URL
+  --ngrok-port <port>         Local port to expose with ngrok when --auto-ngrok is used (default: 8000)
   --model <name>              Ollama text model to pull (default: from .env or llama3.1)
   --vision-model <name>       Optional Ollama vision model to pull (e.g., llava)
   --skip-ollama-pull          Skip pulling Ollama model(s)
@@ -39,6 +42,8 @@ MODEL=""
 VISION_MODEL=""
 SKIP_OLLAMA_PULL=0
 SKIP_WEBHOOK=0
+AUTO_NGROK=0
+NGROK_PORT=8000
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +57,10 @@ while [[ $# -gt 0 ]]; do
       MODEL="${2:-}"; shift 2 ;;
     --vision-model)
       VISION_MODEL="${2:-}"; shift 2 ;;
+    --auto-ngrok)
+      AUTO_NGROK=1; shift ;;
+    --ngrok-port)
+      NGROK_PORT="${2:-}"; shift 2 ;;
     --skip-ollama-pull)
       SKIP_OLLAMA_PULL=1; shift ;;
     --skip-webhook)
@@ -105,6 +114,41 @@ fi
 MODEL="${MODEL:-llama3.1}"
 update_env_key "OLLAMA_MODEL" "$MODEL"
 
+if [[ -z "$BOT_TOKEN" ]]; then
+  BOT_TOKEN="$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || true)"
+fi
+
+if [[ -z "$WEBHOOK_SECRET" ]]; then
+  WEBHOOK_SECRET="$(grep '^TELEGRAM_WEBHOOK_SECRET=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || true)"
+fi
+
+start_ngrok() {
+  local port="$1"
+  local pid_file="$RUNTIME_DIR/ngrok.pid"
+  local log_file="$RUNTIME_DIR/ngrok.log"
+  mkdir -p "$RUNTIME_DIR"
+
+  if [[ -f "$pid_file" ]]; then
+    local existing_pid
+    existing_pid="$(cat "$pid_file")"
+    if kill -0 "$existing_pid" >/dev/null 2>&1; then
+      log "Using existing ngrok process (PID $existing_pid)"
+    else
+      rm -f "$pid_file"
+    fi
+  fi
+
+  if [[ ! -f "$pid_file" ]]; then
+    log "Starting ngrok for local port $port"
+    nohup ngrok http "$port" >"$log_file" 2>&1 &
+    echo "$!" > "$pid_file"
+    sleep 2
+  fi
+
+  curl -fsS http://127.0.0.1:4040/api/tunnels \
+    | python -c 'import json,sys; data=json.load(sys.stdin); print(next((t["public_url"] for t in data.get("tunnels",[]) if str(t.get("public_url","")).startswith("https://")), ""))'
+}
+
 if [[ "$SKIP_OLLAMA_PULL" -eq 0 ]]; then
   if command -v ollama >/dev/null 2>&1; then
     log "Checking Ollama service"
@@ -127,6 +171,19 @@ else
 fi
 
 if [[ "$SKIP_WEBHOOK" -eq 0 ]]; then
+  if [[ -z "$PUBLIC_URL" && "$AUTO_NGROK" -eq 1 ]]; then
+    if command -v ngrok >/dev/null 2>&1; then
+      PUBLIC_URL="$(start_ngrok "$NGROK_PORT")"
+      if [[ -n "$PUBLIC_URL" ]]; then
+        log "Detected ngrok public URL: $PUBLIC_URL"
+      else
+        warn "ngrok started but no HTTPS tunnel was detected at http://127.0.0.1:4040/api/tunnels"
+      fi
+    else
+      warn "ngrok not found. Install it from https://ngrok.com/download and rerun with --auto-ngrok"
+    fi
+  fi
+
   if [[ -n "$BOT_TOKEN" && -n "$WEBHOOK_SECRET" && -n "$PUBLIC_URL" ]]; then
     log "Registering Telegram webhook"
     curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
@@ -134,7 +191,7 @@ if [[ "$SKIP_WEBHOOK" -eq 0 ]]; then
       -d "{\"url\":\"${PUBLIC_URL%/}/telegram/webhook\",\"secret_token\":\"${WEBHOOK_SECRET}\"}" \
       | python -m json.tool
   else
-    warn "Skipping webhook setup. Provide --bot-token, --webhook-secret and --public-url to auto-register it."
+    warn "Skipping webhook setup. Ensure TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET exist in .env, then pass --public-url or --auto-ngrok."
   fi
 else
   log "Skipping Telegram webhook setup as requested"
@@ -154,4 +211,10 @@ Next steps:
 
 3) Health check:
    curl http://127.0.0.1:8000/health
+
+Optional webhook automation examples:
+- Use an existing tunnel URL:
+  ./scripts/setup.sh --public-url "https://xxxx.ngrok-free.app"
+- Start ngrok automatically and register webhook:
+  ./scripts/setup.sh --auto-ngrok
 NEXT

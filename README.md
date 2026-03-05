@@ -49,13 +49,24 @@ You can automate most setup steps with:
 ./scripts/setup.sh
 ```
 
-Common usage with webhook auto-registration:
+This script is now more autonomous for local machines:
+- Creates `.venv`, installs dependencies, and creates `.env` when missing.
+- Reuses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` from `.env` automatically.
+- Can auto-start `ngrok`, discover the HTTPS tunnel URL, and register the Telegram webhook in one run.
+
+Common usage (fully automated webhook registration):
 
 ```bash
 ./scripts/setup.sh \
   --bot-token "<your-token-from-botfather>" \
   --webhook-secret "<any-random-secret-string>" \
-  --public-url "https://abcd-1234.ngrok-free.app"
+  --auto-ngrok
+```
+
+If you already started a tunnel manually, pass its URL:
+
+```bash
+./scripts/setup.sh --public-url "https://abcd-1234.ngrok-free.app"
 ```
 
 Optional flags:
@@ -63,6 +74,7 @@ Optional flags:
 - `--vision-model llava` to pre-pull an image model.
 - `--skip-ollama-pull` if you want to pull models manually later.
 - `--skip-webhook` if you only want local setup.
+- `--ngrok-port 8000` to change which local port is exposed when using `--auto-ngrok`.
 
 Then continue with step 6 to run the API server.
 
@@ -165,7 +177,15 @@ https://abcd-1234.ngrok-free.app
 
 ### 8) Register Telegram webhook
 
-Run this command in terminal (replace placeholder values):
+You have two options:
+
+1. **Automatic (recommended):** rerun setup with webhook automation:
+
+```bash
+./scripts/setup.sh --auto-ngrok
+```
+
+2. **Manual:** run this command in terminal (replace placeholder values):
 
 ```bash
 export TELEGRAM_BOT_TOKEN=<your-bot-token>
