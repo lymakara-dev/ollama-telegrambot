@@ -1,14 +1,25 @@
-from typing import Dict, Optional
+import logging
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 
 from .config import load_settings
+from .jobs import JobRunner
 from .memory import ChatMemory
+from .metrics import BotMetrics
 from .ollama_client import OllamaClient
 from .rag import RagStore
+from .router import ModelRouter
+from .safety import SafetyManager
 from .service import BotService
 from .telegram_client import TelegramClient
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 settings = load_settings()
@@ -16,14 +27,57 @@ telegram_client = TelegramClient(settings.telegram_bot_token)
 ollama_client = OllamaClient(settings.ollama_base_url)
 memory = ChatMemory(settings.chat_memory_turns)
 rag_store = RagStore(settings.knowledge_base_path, settings.rag_chunk_size, settings.rag_top_k)
-service = BotService(settings, telegram_client, ollama_client, memory, rag_store)
+metrics = BotMetrics()
+safety = SafetyManager(
+    blocked_terms=settings.blocked_terms,
+    max_prompt_chars=settings.max_prompt_chars,
+    rate_limit_count=settings.rate_limit_count,
+    rate_limit_window_seconds=settings.rate_limit_window_seconds,
+)
+router = ModelRouter(settings)
+service = BotService(
+    settings,
+    telegram_client,
+    ollama_client,
+    memory,
+    rag_store,
+    safety,
+    metrics,
+    router,
+)
+job_runner = JobRunner(service.process_update)
 
 app = FastAPI(title="Ollama Telegram Bridge")
 
 
+@app.on_event("startup")
+async def startup() -> None:
+    await job_runner.start()
+    logger.info("Background job runner started")
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await job_runner.stop()
+    logger.info("Background job runner stopped")
+
+
 @app.get("/health")
-async def health() -> Dict[str, str]:
-    return {"status": "ok"}
+async def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "queue_size": job_runner.queue_size(),
+    }
+
+
+@app.get("/admin/stats")
+async def admin_stats(x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    if not settings.admin_api_token or x_admin_token != settings.admin_api_token:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+    return {
+        "metrics": metrics.snapshot(),
+        "queue_size": job_runner.queue_size(),
+    }
 
 
 @app.post("/rag/reload")
@@ -44,14 +98,10 @@ async def telegram_webhook(
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     update = await request.json()
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return {"ok": True}
+    accepted = await job_runner.enqueue(update)
+    if not accepted:
+        metrics.inc("dropped_updates")
+        raise HTTPException(status_code=503, detail="Queue is full")
 
-    chat_id = message["chat"]["id"]
-    await telegram_client.send_chat_action(chat_id, "typing")
-
-    prompt, images_b64, model = await service.build_user_prompt_and_images(message)
-    llm_response = await service.call_ollama(chat_id, prompt, images_b64, model)
-    await service.reply_all_formats(chat_id, message, llm_response)
+    metrics.inc("queued_updates")
     return {"ok": True}

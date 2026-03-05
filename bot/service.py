@@ -1,11 +1,16 @@
 import asyncio
 import base64
+import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Settings
 from .memory import ChatMemory
+from .metrics import BotMetrics
 from .ollama_client import OllamaClient
 from .rag import RagStore
+from .router import ModelRouter
+from .safety import SafetyManager
 from .telegram_client import TelegramClient
 from .tools import build_tool_definitions, execute_tool, extract_tool_call
 
@@ -18,12 +23,78 @@ class BotService:
         ollama: OllamaClient,
         memory: ChatMemory,
         rag_store: RagStore,
+        safety: SafetyManager,
+        metrics: BotMetrics,
+        router: ModelRouter,
     ) -> None:
         self.settings = settings
         self.telegram = telegram
         self.ollama = ollama
         self.memory = memory
         self.rag_store = rag_store
+        self.safety = safety
+        self.metrics = metrics
+        self.router = router
+        self.logger = logging.getLogger(__name__)
+
+    async def process_update(self, update: Dict[str, Any]) -> None:
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return
+
+        chat_id = message["chat"]["id"]
+        text = (message.get("text") or "").strip()
+
+        if text == "/stats" and chat_id in self.settings.admin_chat_ids:
+            await self.telegram.api("sendMessage", {"chat_id": chat_id, "text": self._format_stats()})
+            return
+
+        allowed, retry_after = self.safety.check_rate_limit(chat_id)
+        if not allowed:
+            self.metrics.inc("rate_limited_updates")
+            await self.telegram.api(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": f"Rate limit reached. Please retry in {retry_after}s.",
+                },
+            )
+            return
+
+        await self.telegram.send_chat_action(chat_id, "typing")
+
+        prompt, images_b64, suggested_model = await self.build_user_prompt_and_images(message)
+        is_allowed, moderated_prompt = self.safety.moderate_prompt(prompt)
+        if not is_allowed:
+            self.metrics.inc("blocked_prompts")
+            await self.telegram.api(
+                "sendMessage", {"chat_id": chat_id, "text": moderated_prompt}
+            )
+            return
+
+        selected_model = self.router.route(
+            prompt=moderated_prompt,
+            has_image=bool(images_b64),
+            requested_model=suggested_model if suggested_model != self.settings.ollama_model else None,
+        )
+
+        started = time.perf_counter()
+        llm_response = await self.call_ollama(chat_id, moderated_prompt, images_b64, selected_model)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        self.metrics.inc("processed_updates")
+        self.metrics.inc(f"model_used:{selected_model}")
+        self.logger.info("Processed chat_id=%s model=%s elapsed_ms=%s", chat_id, selected_model, elapsed_ms)
+
+        llm_response = self.safety.sanitize_output(llm_response)
+        await self.reply_all_formats(chat_id, message, llm_response)
+
+    def _format_stats(self) -> str:
+        snapshot = self.metrics.snapshot()
+        lines = ["Bot metrics:"]
+        for key in sorted(snapshot.keys()):
+            lines.append(f"- {key}: {snapshot[key]}")
+        return "\n".join(lines)
 
     def _extract_text_from_document(
         self, content: bytes, mime_type: Optional[str], filename: Optional[str]
@@ -104,6 +175,7 @@ class BotService:
             return ""
 
         context_parts = [f"[{idx}] {chunk}" for idx, chunk in enumerate(matched_chunks, start=1)]
+        self.metrics.inc("rag_hits")
         return "\n".join(context_parts)
 
     def build_ollama_messages(
@@ -153,6 +225,7 @@ class BotService:
         tool_call = extract_tool_call(assistant_message)
 
         if tool_call:
+            self.metrics.inc("tool_calls")
             tool_name, arguments = tool_call
             tool_result = await execute_tool(tool_name, arguments)
             messages.append(assistant_message)
