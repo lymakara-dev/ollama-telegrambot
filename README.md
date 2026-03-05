@@ -41,6 +41,31 @@ A FastAPI backend that connects Telegram Bot API updates to a local Ollama insta
 
 These steps assume you already cloned the project and opened a terminal in the project folder.
 
+### Quick setup script (recommended)
+
+You can automate most setup steps with:
+
+```bash
+./scripts/setup.sh
+```
+
+Common usage with webhook auto-registration:
+
+```bash
+./scripts/setup.sh \
+  --bot-token "<your-token-from-botfather>" \
+  --webhook-secret "<any-random-secret-string>" \
+  --public-url "https://abcd-1234.ngrok-free.app"
+```
+
+Optional flags:
+
+- `--vision-model llava` to pre-pull an image model.
+- `--skip-ollama-pull` if you want to pull models manually later.
+- `--skip-webhook` if you only want local setup.
+
+Then continue with step 6 to run the API server.
+
 ### 1) Check that Python is installed
 
 ```bash
