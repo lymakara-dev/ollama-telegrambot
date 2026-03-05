@@ -7,6 +7,7 @@ A FastAPI backend that connects Telegram Bot API updates to a local Ollama insta
 - Receives Telegram updates via webhook.
 - Handles text, voice, image, audio, and document uploads.
 - Sends LLM text reply from local Ollama.
+- Maintains per-chat conversation memory for contextual replies.
 - Responds with the same media type where possible (echoes back media using Telegram `file_id`).
 
 ## Setup
@@ -23,6 +24,8 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
+# Optional: number of stored messages per chat (user+assistant turns)
+CHAT_MEMORY_TURNS=12
 ```
 
 3. Run Ollama locally and pull a model:

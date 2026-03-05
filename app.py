@@ -1,5 +1,6 @@
 import os
-from typing import Any, Dict, Optional
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -11,12 +12,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+CHAT_MEMORY_TURNS = int(os.getenv("CHAT_MEMORY_TURNS", "12"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 app = FastAPI(title="Ollama Telegram Bridge")
+CHAT_MEMORY: Dict[int, Deque[Dict[str, str]]] = defaultdict(
+    lambda: deque(maxlen=CHAT_MEMORY_TURNS)
+)
 
 
 def _extract_prompt(message: Dict[str, Any]) -> str:
@@ -48,16 +53,25 @@ def _extract_prompt(message: Dict[str, Any]) -> str:
     return "\n".join(prompt_parts)
 
 
-async def _call_ollama(prompt: str) -> str:
+def _build_ollama_messages(chat_id: int, prompt: str) -> List[Dict[str, str]]:
+    history = list(CHAT_MEMORY[chat_id])
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a Telegram bot assistant. Keep responses concise and helpful. "
+                "Use the conversation history for continuity when relevant."
+            ),
+        },
+        *history,
+        {"role": "user", "content": prompt},
+    ]
+
+
+async def _call_ollama(chat_id: int, prompt: str) -> str:
     payload = {
         "model": OLLAMA_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a Telegram bot assistant. Keep responses concise and helpful.",
-            },
-            {"role": "user", "content": prompt},
-        ],
+        "messages": _build_ollama_messages(chat_id, prompt),
         "stream": False,
     }
 
@@ -65,7 +79,11 @@ async def _call_ollama(prompt: str) -> str:
         response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
         response.raise_for_status()
         data = response.json()
-    return data.get("message", {}).get("content", "I could not generate a response.")
+
+    llm_response = data.get("message", {}).get("content", "I could not generate a response.")
+    CHAT_MEMORY[chat_id].append({"role": "user", "content": prompt})
+    CHAT_MEMORY[chat_id].append({"role": "assistant", "content": llm_response})
+    return llm_response
 
 
 async def _telegram_api(method: str, payload: Dict[str, Any]) -> None:
@@ -138,6 +156,6 @@ async def telegram_webhook(
 
     chat_id = message["chat"]["id"]
     prompt = _extract_prompt(message)
-    llm_response = await _call_ollama(prompt)
+    llm_response = await _call_ollama(chat_id, prompt)
     await _reply_all_formats(chat_id, message, llm_response)
     return {"ok": True}
