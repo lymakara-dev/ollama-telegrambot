@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +17,9 @@ from .tools import build_tool_definitions, execute_tool, extract_tool_call
 
 
 class BotService:
+    TELEGRAM_MESSAGE_LIMIT = 4096
+    TELEGRAM_SAFE_CHUNK_SIZE = 4000
+
     def __init__(
         self,
         settings: Settings,
@@ -248,8 +252,54 @@ class BotService:
         return llm_response
 
     async def stream_text_reply(self, chat_id: int, text: str) -> None:
+        clean_text = self._format_telegram_text(text)
+        if not clean_text:
+            await self.telegram.api("sendMessage", {"chat_id": chat_id, "text": "…"})
+            return
+
+        chunks = self._split_telegram_chunks(clean_text)
+        await self._stream_single_message(chat_id, chunks[0])
+
+        for chunk in chunks[1:]:
+            await self.telegram.send_chat_action(chat_id, "typing")
+            await self.telegram.api("sendMessage", {"chat_id": chat_id, "text": chunk})
+
+    def _format_telegram_text(self, text: str) -> str:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        trimmed_lines = [line.rstrip() for line in normalized.split("\n")]
+        collapsed_newlines = re.sub(r"\n{3,}", "\n\n", "\n".join(trimmed_lines))
+        return collapsed_newlines.strip()
+
+    def _split_telegram_chunks(self, text: str) -> List[str]:
+        if len(text) <= self.TELEGRAM_MESSAGE_LIMIT:
+            return [text]
+
+        chunks: List[str] = []
+        remaining = text
+
+        while remaining:
+            if len(remaining) <= self.TELEGRAM_SAFE_CHUNK_SIZE:
+                chunks.append(remaining)
+                break
+
+            candidate = remaining[: self.TELEGRAM_SAFE_CHUNK_SIZE]
+            split_at = max(candidate.rfind("\n\n"), candidate.rfind("\n"), candidate.rfind(" "))
+
+            if split_at <= 0:
+                split_at = self.TELEGRAM_SAFE_CHUNK_SIZE
+
+            chunk = remaining[:split_at].strip()
+            if not chunk:
+                chunk = remaining[: self.TELEGRAM_SAFE_CHUNK_SIZE]
+                split_at = len(chunk)
+
+            chunks.append(chunk)
+            remaining = remaining[split_at:].lstrip()
+
+        return chunks
+
+    async def _stream_single_message(self, chat_id: int, text: str) -> None:
         if not text:
-            await self.telegram.api("sendMessage", {"chat_id": chat_id, "text": "..."})
             return
 
         streamed_text = text[: self.settings.stream_chunk_chars]
@@ -279,43 +329,3 @@ class BotService:
         self, chat_id: int, message: Dict[str, Any], llm_response: str
     ) -> None:
         await self.stream_text_reply(chat_id, llm_response)
-
-        if photos := message.get("photo"):
-            await self.telegram.api(
-                "sendPhoto",
-                {
-                    "chat_id": chat_id,
-                    "photo": photos[-1]["file_id"],
-                    "caption": "Image received ✅",
-                },
-            )
-
-        if voice := message.get("voice"):
-            await self.telegram.api(
-                "sendVoice",
-                {
-                    "chat_id": chat_id,
-                    "voice": voice["file_id"],
-                    "caption": "Voice received ✅",
-                },
-            )
-
-        if document := message.get("document"):
-            await self.telegram.api(
-                "sendDocument",
-                {
-                    "chat_id": chat_id,
-                    "document": document["file_id"],
-                    "caption": "File received ✅",
-                },
-            )
-
-        if audio := message.get("audio"):
-            await self.telegram.api(
-                "sendAudio",
-                {
-                    "chat_id": chat_id,
-                    "audio": audio["file_id"],
-                    "caption": "Audio received ✅",
-                },
-            )
