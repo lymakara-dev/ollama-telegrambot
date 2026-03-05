@@ -67,7 +67,7 @@ class BotService:
 
         await self.telegram.send_chat_action(chat_id, "typing")
 
-        prompt, images_b64, suggested_model = await self.build_user_prompt_and_images(message)
+        prompt, images_b64, suggested_model = await self.build_user_prompt_and_images(chat_id, message)
         is_allowed, moderated_prompt = self.safety.moderate_prompt(prompt)
         if not is_allowed:
             self.metrics.inc("blocked_prompts")
@@ -113,16 +113,16 @@ class BotService:
         return ""
 
     async def build_user_prompt_and_images(
-        self, message: Dict[str, Any]
+        self, chat_id: int, message: Dict[str, Any]
     ) -> Tuple[str, List[str], str]:
         prompt_parts: List[str] = []
         images_b64: List[str] = []
         model = self.settings.ollama_model
 
         if text := message.get("text"):
-            prompt_parts.append(f"User text: {text}")
+            prompt_parts.append(f"Current user message:\n{text}")
         if caption := message.get("caption"):
-            prompt_parts.append(f"Caption: {caption}")
+            prompt_parts.append(f"Current user caption:\n{caption}")
 
         if voice := message.get("voice"):
             prompt_parts.append(
@@ -194,7 +194,12 @@ class BotService:
 
         current_user_message: Dict[str, Any] = {
             "role": "user",
-            "content": f"{prompt}\n\n{rag_instruction}",
+            "content": (
+                "Latest user input and metadata:\n"
+                f"{prompt}\n\n"
+                "Relevant knowledge base context:\n"
+                f"{rag_instruction}"
+            ),
         }
         if images_b64:
             current_user_message["images"] = images_b64
@@ -203,10 +208,12 @@ class BotService:
             {
                 "role": "system",
                 "content": (
-                    "You are a Telegram bot assistant. Keep responses concise and helpful. "
-                    "Use conversation history for continuity. Cite knowledge-base facts naturally "
-                    "when context is provided and avoid fabricating unknown facts. "
-                    "Use tools when needed for time/calculation."
+                    "You are a Telegram bot assistant for direct and group chats. "
+                    "Treat conversation history as the primary context source and pay attention to message order. "
+                    "When users ask follow-up questions, resolve references using prior messages before answering. "
+                    "Preserve useful formatting in replies (paragraphs, bullets, and line breaks) when it improves clarity. "
+                    "Use concise, helpful answers, cite provided knowledge-base context naturally, and avoid hallucination. "
+                    "Use tools only when needed for time/calculation or external operations."
                 ),
             },
             *self.memory.history(chat_id),
